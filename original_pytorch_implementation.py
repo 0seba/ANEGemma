@@ -337,6 +337,7 @@ class GemmaAttention(nn.Module):
         # [batch_size, input_len, hidden_dim]
         output = (output.transpose(1, 2).contiguous().view(
             batch_size, input_len, -1))
+
         output = self.o_proj(output)
         return output
 
@@ -447,7 +448,6 @@ class Gemma2DecoderLayer(nn.Module):
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
-
         # MLP
         residual = hidden_states
         if self.pre_feedforward_layernorm is not None:
