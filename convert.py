@@ -77,7 +77,7 @@ def convert_model(
     ).eval().float()
 
     states = []
-    if wmodel.k_cache_local.size(0) > 1:
+    if wmodel.k_cache_local.size(0) > 0:
         states += [
             ct.StateType(
                 wrapped_type=ct.TensorType(shape=wmodel.k_cache_local.size()),
@@ -89,7 +89,7 @@ def convert_model(
             ),
         ]
 
-    if wmodel.k_cache_global.size(0) > 1:
+    if wmodel.k_cache_global.size(0) > 0:
         states += [
             ct.StateType(
                 wrapped_type=ct.TensorType(shape=wmodel.k_cache_global.size()),
@@ -106,6 +106,7 @@ def convert_model(
         shapes=[(1, 1152, 1, s) for s in seqlen],
         default=[1, 1152, 1, seqlen[0]],
     )
+    symbol = input_shape.symbolic_shape[3]
 
     inputs = [
         ct.TensorType(
@@ -116,21 +117,25 @@ def convert_model(
         ),
     ]
     # example_inputs = [torch.randn(1, 1152, 1, seqlen, dtype=torch.float16)]
+    # trace for seqlen 1 but use and materialize enumerated shapes is faster
     example_inputs = {
-        "input_hidden_states": torch.randn(1, 1152, 1, seqlen, dtype=torch.float16)
+        "input_hidden_states": torch.randn(1, 1152, 1, 1, dtype=torch.float16)
     }
     position_shape = ct.EnumeratedShapes(
         shapes=[(s,) for s in seqlen],
         default=[seqlen[0]],
     )
+    position_shape.symbolic_shape[0] = symbol
     mask_shape = ct.EnumeratedShapes(
         shapes=[(1, 1, s, global_kv_cache_length) for s in seqlen],
         default=[1, 1, seqlen[0], global_kv_cache_length],
     )
+    mask_shape.symbolic_shape[2] = symbol
     local_mask_shape = ct.EnumeratedShapes(
         shapes=[(1, 1, s, wmodel.config.sliding_window_size) for s in seqlen],
         default=[1, 1, seqlen[0], wmodel.config.sliding_window_size],
     )
+    local_mask_shape.symbolic_shape[2] = symbol
     if len(states) > 1:
 
         inputs += [
@@ -201,11 +206,16 @@ def convert_model(
             #     torch.tensor([1], dtype=torch.float16),  # min_p
             #     torch.tensor([1], dtype=torch.float32),  # min_p_rng for sampling
             # ]
+            min_p_shape = ct.EnumeratedShapes(
+                shapes=[(s,) for s in seqlen],
+                default=[seqlen[0]],
+            )
+            min_p_shape.symbolic_shape[0] = symbol
             inputs += [
-                ct.TensorType(name="min_p", shape=(1,), dtype=np.float16),
-                ct.TensorType(name="min_p_rng", shape=(1,), dtype=np.float32),
+                ct.TensorType(name="min_p", shape=min_p_shape, dtype=np.float16),
+                ct.TensorType(name="min_p_rng", shape=min_p_shape, dtype=np.float32),
             ]
-            outputs = [
+            outputs += [
                 ct.TensorType(name="min_p_sample_index"),
                 ct.TensorType(name="min_p_sample_value"),
                 ct.TensorType(name="min_p_sum"),
@@ -237,13 +247,17 @@ def convert_model(
             options["position"] = (sq,)
             options["mask"] = (1, 1, sq, global_kv_cache_length)
             options["local_mask"] = (1, 1, sq, wmodel.config.sliding_window_size)
+        if sample:
+            options["min_p"] = (sq,)
+            options["min_p_rng"] = (sq,)
         materialize_options["function_name_to_materialization_map"][
-            f"length_{sq}"
+            f"{args.function_prefix}_{sq}"
         ] = options
     # pipeline.set_options("common::materialize_symbolic_shape_program", materialize_options)
 
     mlmodel: ct.models.MLModel = ct.convert(
         traced_model,
+        convert_to="milinternal",
         inputs=inputs,
         outputs=outputs,
         states=states,
@@ -254,15 +268,34 @@ def convert_model(
         pass_pipeline=pipeline,
         compute_precision=ct.precision.FLOAT16,
     )
-    print(mlmodel._get_mil_internal())
+    print(mlmodel)
+    mlmodel: ct.models.MLModel = ct.convert(
+        mlmodel,
+        # convert_to="milinternal",
+        inputs=inputs,
+        outputs=outputs,
+        # states=states,
+        minimum_deployment_target=ct.target.iOS18,
+        compute_units=ct.ComputeUnit.CPU_AND_NE,
+        # compute_precision=ct.precision.FLOAT16,
+        skip_model_load=True,
+        pass_pipeline=pipeline,
+        compute_precision=ct.precision.FLOAT16,
+    )
 
-    # print("Materializing and saving")
-    for sq, vals in materialize_options["function_name_to_materialization_map"].items():
-        ct.utils.materialize_dynamic_shape_mlmodel(
-            mlmodel,
-            {"main": vals},
-            f"{sq}_argmax_CHUNK_{prediction_head_chunk_size}_topk_{use_topk}",
-        )
+
+    print("Materializing and saving")
+    # for sq, vals in materialize_options["function_name_to_materialization_map"].items():
+    #     ct.utils.materialize_dynamic_shape_mlmodel(
+    #         mlmodel,
+    #         {"main": vals},
+    #         f"{sq}_argmax_CHUNK_{prediction_head_chunk_size}_topk_{use_topk}",
+    #     )
+    ct.utils.materialize_dynamic_shape_mlmodel(
+        mlmodel,
+        materialize_options["function_name_to_materialization_map"],
+        save_filename,
+    )
 
     # mlmodel.save(save_filename)
     # ct.models.utils.save_multifunction(mlmodel, save_filename)
@@ -285,6 +318,7 @@ def parse_args():
     parser.add_argument("--skip_model_load", action="store_true", default=False)
     parser.add_argument("--sample", action="store_true", default=False)
     parser.add_argument("--prediction_head_chunk_size", type=int, default=16_384)
+    parser.add_argument("--function_prefix", type=str, required=True)
 
     parser.add_argument("--from-multifunction", type=str)
     args = parser.parse_args()
@@ -296,8 +330,8 @@ if __name__ == "__main__":
     model = load_pytorch_model(args.weights_dir).half()
     ane_model = ANEGemmaForCausalLM(model, state_implementation="single")
 
-    if args.predict:
-        assert args.input_seqlen[0] == 1 and len(args.input_seqlen) == 1, "Predict mode only supports seqlen=1"
+    # if args.sample:
+    #     assert args.input_seqlen[0] == 1 and len(args.input_seqlen) == 1, "Sample mode only supports seqlen=1"
 
     convert_model(
         ane_model,

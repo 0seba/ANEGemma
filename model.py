@@ -404,7 +404,7 @@ class ANEGemmaModel(nn.Module):
             if layer.attn_type == gemma_config.AttentionType.LOCAL_SLIDING:
                 kv_write_indices = local_write_indices
             else:
-                kv_write_indices = local_write_indices
+                kv_write_indices = global_write_indices
             # kv_cache_i = (
             #     kv_cache[i] if self.state_implementation == "per_layer" else kv_cache
             # )
