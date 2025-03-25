@@ -49,7 +49,7 @@ class ANERMSNorm(RMSNorm):
         # TODO find and way to use reduce_sum_square MIL op
         sq_sum = xscaled.square().sum(dim=dim, keepdim=True)
         rsqrt = torch.rsqrt(sq_sum)
-        dimroot = (x.size(dim) ** (1 / 2))
+        dimroot = x.size(dim) ** (1 / 2)
         return rsqrt * dimroot * xscaled
 
     def forward(self, x: torch.Tensor, num_expands=2, dim=-3) -> torch.Tensor:
@@ -103,9 +103,12 @@ def apply_rotary_pos_emb(
 
 
 class ANEGemmaAttention(nn.Module):
-    def __init__(self, pytorch_layer: GemmaAttention, layer_index: int):
+    def __init__(
+        self, pytorch_layer: GemmaAttention, layer_index: int, attention_index: int
+    ):
         super().__init__()
         self.layer_index = layer_index
+        self.attention_index = attention_index
         self.num_heads = pytorch_layer.num_heads
         self.num_kv_heads = pytorch_layer.num_kv_heads
         self.num_queries_per_kv = pytorch_layer.num_queries_per_kv
@@ -140,7 +143,10 @@ class ANEGemmaAttention(nn.Module):
         kv_cache: Tuple[torch.Tensor, torch.Tensor],
         mask: torch.Tensor,
         local_mask: torch.Tensor = None,
+        kv_cache_layer_write_idx: Optional[int] = None,
     ) -> torch.Tensor:
+        if kv_cache_layer_write_idx is None:
+            kv_cache_layer_write_idx = self.attention_index
         batch_size = hidden_states.size(0)
         seqlen = hidden_states.size(-1)
         qkv = self.qkv_proj(hidden_states)
@@ -168,32 +174,38 @@ class ANEGemmaAttention(nn.Module):
         xq = xq.chunk(self.num_heads, 1)
 
         k_cache, v_cache = kv_cache
+        if seqlen == k_cache.size(2):
+            start = 0
+            end = seqlen
+        else:
+            start = kv_write_indices
+            end = kv_write_indices + seqlen
         if k_cache.size(0) > 1:
             k_cache[
-                self.layer_index : self.layer_index + 1,
+                kv_cache_layer_write_idx : kv_cache_layer_write_idx + 1,
                 : self.num_kv_heads,
-                kv_write_indices : kv_write_indices + 1,
+                start:end,
                 : self.head_dim,
             ] = xk
             v_cache[
-                self.layer_index : self.layer_index + 1,
+                kv_cache_layer_write_idx : kv_cache_layer_write_idx + 1,
                 : self.num_kv_heads,
-                kv_write_indices : kv_write_indices + 1,
+                start:end,
                 : self.head_dim,
             ] = xv
-            xk = k_cache[self.layer_index : self.layer_index + 1]
-            xv = v_cache[self.layer_index : self.layer_index + 1]
+            xk = k_cache[kv_cache_layer_write_idx : kv_cache_layer_write_idx + 1]
+            xv = v_cache[kv_cache_layer_write_idx : kv_cache_layer_write_idx + 1]
         else:
             k_cache[
                 :1,
                 : self.num_kv_heads,
-                kv_write_indices : kv_write_indices + 1,
+                start:end,
                 : self.head_dim,
             ] = xk
             v_cache[
                 :1,
                 : self.num_kv_heads,
-                kv_write_indices : kv_write_indices + 1,
+                start:end,
                 : self.head_dim,
             ] = xv
             xk = k_cache
@@ -235,6 +247,24 @@ class ANEGemmaAttention(nn.Module):
         return output
 
 
+# class Add(nn.Module):
+#     def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+#         return x + y
+
+
+class NamedAdd(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, residual, normalized_mlp_output):
+        layer_output_hidden_states = residual + normalized_mlp_output
+        return layer_output_hidden_states
+
+    @staticmethod
+    def symbolic(
+        g: torch.Graph, residual: torch.Value, normalized_mlp_output: torch.Value
+    ) -> torch.Value:
+        return g.op("Add", residual, normalized_mlp_output)
+
+
 # Name mantains pytorch Gemma structure
 class ANEGemma2DecoderLayer(Gemma2DecoderLayer):
     def __init__(
@@ -242,12 +272,15 @@ class ANEGemma2DecoderLayer(Gemma2DecoderLayer):
         pytorch_layer: Gemma2DecoderLayer,
         config: gemma_config.GemmaConfig,
         layer_index: int,
+        attention_index: int,
     ):
         nn.Module.__init__(self)
         # super().__init__()
         self.config = config
         self.attn_type = pytorch_layer.attn_type
-        self.self_attn = ANEGemmaAttention(pytorch_layer.self_attn, layer_index)
+        self.self_attn = ANEGemmaAttention(
+            pytorch_layer.self_attn, layer_index, attention_index
+        )
         self.mlp = ANEGemmaMLP(pytorch_layer.mlp)
         self.input_layernorm = ANERMSNorm(pytorch_layer.input_layernorm)
         self.post_attention_layernorm = ANERMSNorm(
@@ -263,6 +296,45 @@ class ANEGemma2DecoderLayer(Gemma2DecoderLayer):
             if config.use_post_ffw_norm
             else None
         )
+        # self.rename = Add()
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        kv_write_indices: torch.Tensor,
+        kv_cache: Tuple[torch.Tensor, torch.Tensor],
+        mask: torch.Tensor,
+        local_mask: torch.Tensor,
+        kv_cache_layer_write_idx: Optional[int] = None,
+    ) -> torch.Tensor:
+        # Self Attention
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(
+            hidden_states=hidden_states,
+            freqs_cis=freqs_cis,
+            kv_write_indices=kv_write_indices,
+            kv_cache=kv_cache,
+            mask=mask,
+            local_mask=local_mask,
+            kv_cache_layer_write_idx=kv_cache_layer_write_idx,
+        )
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = residual + hidden_states
+        # MLP
+        residual = hidden_states
+        if self.pre_feedforward_layernorm is not None:
+            hidden_states = self.pre_feedforward_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        if self.post_feedforward_layernorm is not None:
+            hidden_states = self.post_feedforward_layernorm(hidden_states)
+        layer_output_hidden_states = residual + hidden_states
+        # layer_output_hidden_states = residual.add_(hidden_states)
+        # layer_output_hidden_states = residual.add(hidden_states)
+        # layer_output_hidden_states = NamedAdd.apply(residual, hidden_states)
+
+        return layer_output_hidden_states
 
 
 class ANEGemmaModel(nn.Module):
@@ -275,42 +347,83 @@ class ANEGemmaModel(nn.Module):
         super().__init__()
         self.config: gemma_config.GemmaConfig = config
         self.layers = nn.ModuleList()
+        local_counter = 0
+        global_counter = 0
         for i, layer in enumerate(layers):
-            self.layers.append(ANEGemma2DecoderLayer(layer, config, i))
+            attention_index = (
+                local_counter
+                if layer.attn_type == gemma_config.AttentionType.LOCAL_SLIDING
+                else global_counter
+            )
+            self.layers.append(ANEGemma2DecoderLayer(layer, config, i, attention_index))
+            if layer.attn_type == gemma_config.AttentionType.LOCAL_SLIDING:
+                local_counter += 1
+            else:
+                global_counter += 1
         # self.norm = ANERMSNorm(pytorch_model.norm)
         self.state_implementation = state_implementation
+        self.normalizer = torch.tensor(
+            self.config.hidden_size**0.5, dtype=torch.float16
+        )
 
     def forward(
         self,
         hidden_states,
         rope_embs,
-        kv_write_indices,
+        global_write_indices,
+        local_write_indices,
         mask,
         local_mask,
         layer_from=0,
         layer_to=None,
-        kv_cache=None,
+        global_kv_cache=None,
+        local_kv_cache=None,
     ):
-        if kv_cache is not None:
-            pass
-        elif self.state_implementation == "single":
-            kv_cache = (self.k_cache, self.v_cache)
-        elif self.state_implementation == "per_layer":
-            kv_cache = [
-                (getattr(self, f"k_cache_{i}"), getattr(self, f"v_cache_{i}"))
-                for i in range(len(self.layers))
-            ]
-        else:
-            raise ValueError(
-                f"Unknown state implementation: {self.state_implementation}"
-            )
+        # if global_kv_cache is not None:
+        #     pass
+        # elif self.state_implementation == "single":
+        #     global_kv_cache = (self.k_cache, self.v_cache)
+        # elif self.state_implementation == "per_layer":
+        #     kv_cache = [
+        #         (getattr(self, f"k_cache_{i}"), getattr(self, f"v_cache_{i}"))
+        #         for i in range(len(self.layers))
+        #     ]
+        # else:
+        #     raise ValueError(
+        #         f"Unknown state implementation: {self.state_implementation}"
+        #     )
+
+        local_idx = 0
+        global_idx = 0
         if layer_to is None:
             layer_to = len(self.layers)
         for i in range(layer_from, layer_to):
+            if i == 0:
+                hidden_states = hidden_states * self.normalizer
             layer: ANEGemma2DecoderLayer = self.layers[i]
-            kv_cache_i = (
-                kv_cache[i] if self.state_implementation == "per_layer" else kv_cache
-            )
+            if layer.attn_type == gemma_config.AttentionType.LOCAL_SLIDING:
+                kv_write_indices = local_write_indices
+            else:
+                kv_write_indices = local_write_indices
+            # kv_cache_i = (
+            #     kv_cache[i] if self.state_implementation == "per_layer" else kv_cache
+            # )
+            if layer.attn_type == gemma_config.AttentionType.LOCAL_SLIDING:
+                kv_cache = local_kv_cache
+                idx = local_idx
+                kv_cache_layer_write_idx = i - layer_from - global_idx
+                local_idx += 1
+            else:
+                kv_cache = global_kv_cache
+                idx = global_idx
+                kv_cache_layer_write_idx = i - layer_from - local_idx
+                global_idx += 1
+
+            if type(kv_cache) is list:
+                kv_cache_i = kv_cache[i]
+            else:
+                kv_cache_i = kv_cache
+
             hidden_states = layer(
                 hidden_states,
                 rope_embs,
@@ -318,6 +431,7 @@ class ANEGemmaModel(nn.Module):
                 kv_cache_i,
                 mask,
                 local_mask,
+                kv_cache_layer_write_idx,
             )
         return hidden_states
 
@@ -334,32 +448,36 @@ class ANEGemmaForCausalLM(nn.Module):
         )
         self.embedder: Embedding = pytorch_model.embedder
         self.norm = ANERMSNorm(pytorch_model.model.norm)
+        # self.normalizer = torch.tensor(
+        #     self.config.hidden_size**0.5, dtype=torch.float16
+        # )
 
     def forward(
         self,
         hidden_states,
-        kv_write_indices,
+        global_write_indices,
+        local_write_indices,
         rope_embs,
         mask=None,
         local_mask=None,
         layer_from=0,
         layer_to=None,
         apply_final_norm=True,
-        kv_cache=None,
+        global_kv_cache=None,
+        local_kv_cache=None,
     ):
-        normalizer = torch.tensor(
-            self.config.hidden_size**0.5, dtype=hidden_states.dtype
-        )
-        hidden_states = hidden_states * normalizer
+        # hidden_states = hidden_states * normalizer
         hidden_states = self.model(
             hidden_states,
             rope_embs,
-            kv_write_indices,
+            global_write_indices,
+            local_write_indices,
             mask,
             local_mask,
             layer_from,
             layer_to,
-            kv_cache,
+            global_kv_cache,
+            local_kv_cache,
         )
         if apply_final_norm:
             hidden_states = self.norm(hidden_states)
@@ -396,16 +514,19 @@ class Wrapper(torch.nn.Module):
         apply_final_norm=True,
         predict=True,
         prediction_head_chunk_size=16_384,
+        use_topk=False,
+        global_kv_cache_length=None,
     ):
         super().__init__()
         self.model = model
         self.config = self.model.config
-        self.layer_from = layer_from
-        self.layer_to = layer_to
+        self.layer_from = len(model.model.layers) if layer_from == -1 else layer_from
+        self.layer_to = layer_to if layer_to is not None else len(model.model.layers)
         self.state_implementation = state_implementation
         self.apply_final_norm = apply_final_norm
         self.predict = predict
         self.prediction_head_chunk_size = prediction_head_chunk_size
+        self.use_topk = use_topk
         self.num_layers = (layer_to or model.config.num_hidden_layers) - layer_from
         self.local_cos_emb, self.local_sin_emb = compute_rope_embedding(
             precompute_freqs_cis(
@@ -421,44 +542,79 @@ class Wrapper(torch.nn.Module):
                 self.config.rope_wave_length[gemma_config.AttentionType.GLOBAL],
             )
         )
-        self.init_cache(state_implementation)
+        self.global_kv_cache_length = (
+            global_kv_cache_length
+            if global_kv_cache_length is not None
+            else self.config.sliding_window_size
+        )
+        self.init_cache()
 
-    def forward(self, hidden_states, kv_write_indices, position, *args):
+    def forward(
+        self,
+        input_hidden_states,
+        global_write_indices=None,
+        local_write_indices=None,
+        position=None,
+        mask=None,
+        local_mask=None,
+        min_p=None,
+        min_p_rng=None,
+    ):
+        hidden_states = input_hidden_states
         if self.state_implementation == "single":
-            kv_cache = (self.k_cache, self.v_cache)
+            local_kv_cache = (self.k_cache_local, self.v_cache_local)
+            global_kv_cache = (self.k_cache_global, self.v_cache_global)
         else:
-            kv_cache = []
             for i in range(self.num_layers):
                 kv_cache.append(
-                    (getattr(self, f"k_cache_{i}"), getattr(self, f"v_cache_{i}"))
+                    (
+                        getattr(self, f"k_cache_local_{i}"),
+                        getattr(self, f"v_cache_local_{i}"),
+                    )
                 )
-        if not torch.is_tensor(position):
-            position = torch.asarray(position, dtype=torch.int32).view(1, 1)
+        if position is not None:
+            if not torch.is_tensor(position):
+                position = torch.asarray(position, dtype=torch.int32).view(1, 1)
 
-        rope_embs = {}
-        rope_embs[gemma_config.AttentionType.LOCAL_SLIDING] = (
-            self.local_cos_emb[position].unsqueeze(1),
-            self.local_sin_emb[position].unsqueeze(1),
-        )
-        rope_embs[gemma_config.AttentionType.GLOBAL] = (
-            self.global_cos_emb[position].unsqueeze(1),
-            self.global_sin_emb[position].unsqueeze(1),
-        )
+            rope_embs = {}
+            embs_size = (
+                1,
+                1,
+                self.config.max_position_embeddings,
+                self.config.head_dim,
+            )
+            rope_embs[gemma_config.AttentionType.LOCAL_SLIDING] = (
+                self.local_cos_emb.view(*embs_size)[:, :, position],
+                self.local_sin_emb.view(*embs_size)[:, :, position],
+            )
+            rope_embs[gemma_config.AttentionType.GLOBAL] = (
+                self.global_cos_emb.view(*embs_size)[:, :, position],
+                self.global_sin_emb.view(*embs_size)[:, :, position],
+            )
+        else:
+            rope_embs = None
         hidden_states = self.model(
             hidden_states,
-            kv_write_indices,
+            global_write_indices,
+            local_write_indices,
             rope_embs,
-            *args,
+            mask,
+            local_mask,
             layer_from=self.layer_from,
             layer_to=self.layer_to,
             apply_final_norm=self.apply_final_norm,
-            kv_cache=kv_cache,
+            global_kv_cache=global_kv_cache,
+            local_kv_cache=local_kv_cache,
         )
         if self.predict:
             head_chunks = self.model.embedder.weight.split(
                 self.prediction_head_chunk_size, dim=0
             )
-            logits, topks, values, lses = [], [], [], []
+            logits: List[torch.Tensor] = []
+            topks: List[torch.Tensor] = []
+            values: List[torch.Tensor] = []
+            lses: List[torch.Tensor] = []
+            # for head_chunk in head_chunks[:8]:
             for head_chunk in head_chunks:
                 _logits = F.conv2d(
                     hidden_states, head_chunk.unsqueeze(-1).unsqueeze(-1)
@@ -468,55 +624,104 @@ class Wrapper(torch.nn.Module):
                     _logits = torch.tanh(_logits)
                     _logits = _logits * self.model.config.final_logit_softcapping
                 logits.append(_logits)
-                lses.append(torch.logsumexp(_logits, dim=1, keepdim=True))
 
-                # Would be better to do this here? Less data movement
-                # But topk is not supported on M1
-                # topk = torch.topk(_logits, k=1, dim=1, sorted=True)
-                # topks.append(topk.indices)
-                # values.append(topk.values)
+                # m1 does not support topk, a17pro, m3 do (don't know about m2)
+                if self.use_topk:
+                    m, indices = _logits.topk(1, dim=1, largest=True)
+                    topks.append(indices)  # M1 does not support topk =(
+                else:
+                    m = _logits.max(dim=1, keepdim=True)
+                    # if self.prediction_head_chunk_size <= 2048: # does not work
+                    #     topks.append(m.indices)  # argmax not M1 friendly either with dims > 2048
+                    m = m.values
 
-            lse = torch.logsumexp(torch.cat(lses, dim=1), dim=1, keepdim=True)
+                values.append(m)
+                # logsumexp float16 stability
+                _logits = _logits - m
+                lses.append(torch.logsumexp(_logits, dim=1, keepdim=True) + m)
+
+            # if self.prediction_head_chunk_size <= 2048:
+                # topks = torch.cat(topks, dim=1) # uint16 concat not supported
+            values = torch.cat(values, dim=1)
+            max_value, argmax = torch.max(values, dim=1, keepdim=True)
+
+            lses = torch.cat(lses, dim=1)
+            m = lses.max(dim=1, keepdim=True).values
+            lse = torch.logsumexp(lses - m, dim=1, keepdim=True) + m
+            max_value = torch.exp(max_value - lse)
+            min_p_masked = []
+            min_p_sum = 0
             for i in range(len(logits)):
                 logits[i] = torch.exp(logits[i] - lse)
+                if min_p is not None:
+                    min_p_masked.append(
+                        logits[i].where(
+                            logits[i] > (min_p * max_value),
+                            torch.tensor(0, dtype=torch.float16),
+                        )
+                    )
+                    min_p_sum += torch.sum(min_p_masked[i], dim=1, keepdim=True)
 
-            # for _logits in logits:
-            #     # topk = torch.topk(_logits, k=1, dim=1, sorted=True)
-            #     # topks.append(topk.indices)
-            #     # values.append(topk.values)
-            #     topks.append(torch.argmax(_logits, dim=1, keepdim=True))
-            #     values.append(torch.max(_logits, dim=1, keepdim=True))
-            # values = torch.cat(values, dim=1)
-            # topks = [torch.asarray(tp, dtype=torch.int32) for tp in topks]
-            # topks = torch.cat(topks, dim=1) # Cannot concat uint16 on ANE (tested on M1)
-
-            # topk = torch.topk(values, k=1, dim=1, sorted=True)
-            # topk, topkvalue = topk.indices, topk.values
-            # topkvalue -= lse
-            # topk = topk * self.prediction_head_chunk_size + torch.gather(
-            #     topks, dim=1, index=topk
-            # )  # this last gather is gonna get pushed to cpu
-
+            # this is a very big concat, on older CoreML versions I've seen it break ANE by itself,
+            # more recent tests perform the concat on ANE, but not the following operations
             logits = torch.cat(logits, dim=1)
-            # return (
-            #     topks,
-            #     values,
-            #     lse,
-            #     # topks,
-            #     # values,
-            #     logits,
-            # )
-            return logits.argmax(1), logits, lse
+            if min_p is not None:
+                min_p_masked = torch.cat(min_p_masked, dim=1).to(dtype=torch.float32)
+                min_p_masked = torch.cumsum(min_p_masked, dim=1, dtype=torch.float32)
+
+            # if self.use_topk or self.prediction_head_chunk_size <= 2048:
+            if self.use_topk:
+                topks = torch.cat([tk.to(torch.int32) for tk in topks], dim=1)
+                argmax = (
+                    torch.gather(topks, dim=1, index=argmax).to(torch.int32)
+                    + self.prediction_head_chunk_size * argmax
+                )
+            else:
+                argmax = torch.argmax(logits, dim=1, keepdim=True)
+
+            if min_p is not None:
+                min_p_masked = min_p_masked.where(
+                    min_p_masked > (min_p_sum.to(dtype=torch.float32) * min_p_rng),
+                    torch.tensor(100, dtype=torch.float32),
+                )
+                # min_p_sample = torch.argmin(min_p_masked, dim=1, keepdim=True)
+                min_p_sample = torch.min(
+                    min_p_masked, dim=1, keepdim=True
+                )  # pure argmin not supported in 8.2 yet, next release should
+
+                return (
+                    argmax,
+                    max_value,
+                    logits,
+                    lse,
+                    min_p_sample.indices,
+                    min_p_sample.values,
+                    min_p_sum,
+                )
+
+            return argmax, max_value, logits, lse
 
         return hidden_states
 
-    def init_cache(self, state_implementation):
-        if state_implementation == "single":
+    def init_cache(self):
+        if self.state_implementation == "single":
+            # TODO fix for striped local-global attention cache state
+            num_local_layers = 0
+            num_global_layers = 0
+            # for layer in self.model.model.layers:
+            for i in range(self.layer_from, self.layer_to):
+                layer = self.model.model.layers[i]
+                if layer.attn_type == gemma_config.AttentionType.LOCAL_SLIDING:
+                    print(i, "LOCAL")
+                    num_local_layers += 1
+                else:
+                    num_global_layers += 1
+                    print(i, "GLOBAL")
             self.register_buffer(
-                "k_cache",
+                "k_cache_local",
                 torch.zeros(
                     (
-                        self.num_layers,
+                        num_local_layers,
                         self.config.num_key_value_heads,
                         self.config.sliding_window_size,
                         self.config.head_dim,
@@ -525,10 +730,10 @@ class Wrapper(torch.nn.Module):
                 ),
             )
             self.register_buffer(
-                "v_cache",
+                "v_cache_local",
                 torch.zeros(
                     (
-                        self.num_layers,
+                        num_local_layers,
                         self.config.num_key_value_heads,
                         self.config.sliding_window_size,
                         self.config.head_dim,
@@ -536,15 +741,49 @@ class Wrapper(torch.nn.Module):
                     dtype=torch.float16,
                 ),
             )
-        elif state_implementation == "per_layer":
-            for i in range(self.num_layers):
+            self.register_buffer(
+                "k_cache_global",
+                torch.zeros(
+                    (
+                        num_global_layers,
+                        self.config.num_key_value_heads,
+                        self.global_kv_cache_length,
+                        self.config.head_dim,
+                    ),
+                    dtype=torch.float16,
+                ),
+            )
+            self.register_buffer(
+                "v_cache_global",
+                torch.zeros(
+                    (
+                        num_global_layers,
+                        self.config.num_key_value_heads,
+                        self.global_kv_cache_length,
+                        self.config.head_dim,
+                    ),
+                    dtype=torch.float16,
+                ),
+            )
+        elif self.state_implementation == "per_layer":
+            layer: Gemma2DecoderLayer
+            # for i, layer in enumerate(self.model.model.layers):
+            for i in range(self.layer_from, self.layer_to):
+                layer = self.model.model.layers[i]
+                if (
+                    layer.self_attn.attn_type
+                    == gemma_config.AttentionType.LOCAL_SLIDING
+                ):
+                    seqlen = layer.self_attn.sliding_window_size
+                else:
+                    seqlen = self.global_kv_cache_length
                 self.register_buffer(
                     f"k_cache_{i}",
                     torch.zeros(
                         (
                             1,
                             self.config.num_key_value_heads,
-                            self.config.sliding_window_size,
+                            seqlen,
                             self.config.head_dim,
                         ),
                         dtype=torch.float16,
@@ -556,7 +795,7 @@ class Wrapper(torch.nn.Module):
                         (
                             1,
                             self.config.num_key_value_heads,
-                            self.config.sliding_window_size,
+                            seqlen,
                             self.config.head_dim,
                         ),
                         dtype=torch.float16,
