@@ -48,6 +48,16 @@ def load_pytorch_model(weights_dir, device="cpu"):
     return model
 
 
+def build_shape(shapes, symbol=None, symbol_idx=None):
+    if len(shapes) > 1:
+        shape = ct.EnumeratedShapes(shapes=shapes, default=shapes[0])
+        if symbol is not None and symbol_idx is not None:
+            shape.symbolic_shape[symbol_idx] = symbol
+        return shape
+    else:
+        return shapes[0]
+
+
 def convert_model(
     ane_model,
     seqlen,
@@ -64,17 +74,21 @@ def convert_model(
 ):
 
     num_layers = ane_model.config.num_hidden_layers
-    wmodel = Wrapper(
-        ane_model,
-        layer_from=layer_from,
-        layer_to=layer_to,
-        use_topk=use_topk,
-        predict=predict,
-        apply_final_norm=apply_final_norm,
-        global_kv_cache_length=global_kv_cache_length,
-        state_implementation="single",  # I do not recomend one state per layer
-        prediction_head_chunk_size=prediction_head_chunk_size,
-    ).eval().float()
+    wmodel = (
+        Wrapper(
+            ane_model,
+            layer_from=layer_from,
+            layer_to=layer_to,
+            use_topk=use_topk,
+            predict=predict,
+            apply_final_norm=apply_final_norm,
+            global_kv_cache_length=global_kv_cache_length,
+            state_implementation="single",  # I do not recomend one state per layer
+            prediction_head_chunk_size=prediction_head_chunk_size,
+        )
+        .eval()
+        .float()
+    )
 
     states = []
     if wmodel.k_cache_local.size(0) > 0:
@@ -101,12 +115,11 @@ def convert_model(
             ),
         ]
 
-        # Set the input_shape to use EnumeratedShapes.
-    input_shape = ct.EnumeratedShapes(
-        shapes=[(1, 1152, 1, s) for s in seqlen],
-        default=[1, 1152, 1, seqlen[0]],
-    )
-    symbol = input_shape.symbolic_shape[3]
+    # Set the input_shape to use EnumeratedShapes.
+    input_shape = build_shape([(1, 1152, 1, s) for s in seqlen])
+    symbol = None
+    if isinstance(input_shape, ct.EnumeratedShapes):
+        symbol = input_shape.symbolic_shape[3]
 
     inputs = [
         ct.TensorType(
@@ -121,21 +134,15 @@ def convert_model(
     example_inputs = {
         "input_hidden_states": torch.randn(1, 1152, 1, 1, dtype=torch.float16)
     }
-    position_shape = ct.EnumeratedShapes(
-        shapes=[(s,) for s in seqlen],
-        default=[seqlen[0]],
+    position_shape = build_shape([(s,) for s in seqlen], symbol=symbol, symbol_idx=0)
+    mask_shape = build_shape(
+        [(1, 1, s, global_kv_cache_length) for s in seqlen], symbol=symbol, symbol_idx=2
     )
-    position_shape.symbolic_shape[0] = symbol
-    mask_shape = ct.EnumeratedShapes(
-        shapes=[(1, 1, s, global_kv_cache_length) for s in seqlen],
-        default=[1, 1, seqlen[0], global_kv_cache_length],
+    local_mask_shape = build_shape(
+        [(1, 1, s, wmodel.config.sliding_window_size) for s in seqlen],
+        symbol=symbol,
+        symbol_idx=2,
     )
-    mask_shape.symbolic_shape[2] = symbol
-    local_mask_shape = ct.EnumeratedShapes(
-        shapes=[(1, 1, s, wmodel.config.sliding_window_size) for s in seqlen],
-        default=[1, 1, seqlen[0], wmodel.config.sliding_window_size],
-    )
-    local_mask_shape.symbolic_shape[2] = symbol
     if len(states) > 1:
 
         inputs += [
@@ -206,11 +213,9 @@ def convert_model(
             #     torch.tensor([1], dtype=torch.float16),  # min_p
             #     torch.tensor([1], dtype=torch.float32),  # min_p_rng for sampling
             # ]
-            min_p_shape = ct.EnumeratedShapes(
-                shapes=[(s,) for s in seqlen],
-                default=[seqlen[0]],
+            min_p_shape = build_shape(
+                [(s,) for s in seqlen], symbol=symbol, symbol_idx=0
             )
-            min_p_shape.symbolic_shape[0] = symbol
             inputs += [
                 ct.TensorType(name="min_p", shape=min_p_shape, dtype=np.float16),
                 ct.TensorType(name="min_p_rng", shape=min_p_shape, dtype=np.float32),
@@ -269,6 +274,7 @@ def convert_model(
         compute_precision=ct.precision.FLOAT16,
     )
     print(mlmodel)
+    mlmodel.export_as_multifunction = True
     mlmodel: ct.models.MLModel = ct.convert(
         mlmodel,
         # convert_to="milinternal",
@@ -283,21 +289,20 @@ def convert_model(
         compute_precision=ct.precision.FLOAT16,
     )
 
-
-    print("Materializing and saving")
-    # for sq, vals in materialize_options["function_name_to_materialization_map"].items():
+    # print("Materializing and saving")
+    # # for sq, vals in materialize_options["function_name_to_materialization_map"].items():
     #     ct.utils.materialize_dynamic_shape_mlmodel(
     #         mlmodel,
     #         {"main": vals},
     #         f"{sq}_argmax_CHUNK_{prediction_head_chunk_size}_topk_{use_topk}",
     #     )
-    ct.utils.materialize_dynamic_shape_mlmodel(
-        mlmodel,
-        materialize_options["function_name_to_materialization_map"],
-        save_filename,
-    )
+    # ct.utils.materialize_dynamic_shape_mlmodel(
+    #     mlmodel,
+    #     materialize_options["function_name_to_materialization_map"],
+    #     save_filename,
+    # )
 
-    # mlmodel.save(save_filename)
+    mlmodel.save(save_filename)
     # ct.models.utils.save_multifunction(mlmodel, save_filename)
     # if not skip_model_load:
     #     print("Loading")
