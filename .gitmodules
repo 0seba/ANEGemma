@@ -1,0 +1,3 @@
+[submodule "third_party/M1"]
+	path = third_party/M1
+	url = https://github.com/jxiw/M1.git
