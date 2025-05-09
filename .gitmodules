@@ -1,3 +1,6 @@
 [submodule "third_party/M1"]
 	path = third_party/M1
 	url = https://github.com/jxiw/M1.git
+[submodule "third_party/dia"]
+	path = third_party/dia
+	url = https://github.com/nari-labs/dia.git
