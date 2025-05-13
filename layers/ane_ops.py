@@ -33,6 +33,22 @@ def ane_rms_norm(
 
     return x
 
+class ANERMSNorm(nn.Module):
+    def __init__(self, layer: nn.RMSNorm, dim: int, w_num_unsqueezes: int):
+        super().__init__()
+        self.layer = layer
+        self.dim = dim
+        self.w_num_unsqueezes = w_num_unsqueezes
+
+    def forward(self, x):
+        return ane_rms_norm(
+            x,
+            dim=self.dim,
+            w=self.layer.weight,
+            w_num_unsqueezes=self.w_num_unsqueezes,
+            eps=self.layer.eps,
+        )
+
 def ane_linear(x: Tensor, w: Tensor, bias: Optional[Tensor] = None, w_num_unsqueezes: int = 2):
     # Assume x has shape (B, C, 1, L)
     # w has shape (D, C)

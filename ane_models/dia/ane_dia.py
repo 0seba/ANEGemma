@@ -9,9 +9,14 @@ from ane_models.dia.dia.dia.layers import (
     MlpBlock,
     RotaryEmbedding,
     Attention,
+    EncoderLayer,
 )
-from ane_models.dia.dia.dia.state import KVCache
-from layers.ane_ops import ane_linear, simple_attention, update_kv_cache
+from layers.ane_ops import (
+    ane_linear,
+    simple_attention,
+    update_kv_cache,
+    ANERMSNorm,
+)
 from layers.ane_dense_general import ANEDenseGeneral
 
 
@@ -110,10 +115,10 @@ class ANEAttention(nn.Module):
     def __init__(
         self,
         attn: Attention,
-        layer_idx: int = 0,
+        # layer_idx: int = 0,
     ):
         super().__init__()
-        self.layer_idx = layer_idx
+        # self.layer_idx = layer_idx
         self.num_query_heads = attn.num_query_heads
         self.num_kv_heads = attn.num_kv_heads
         self.head_dim = attn.head_dim
@@ -155,8 +160,8 @@ class ANEAttention(nn.Module):
         Returns:
             Tuple of (output tensor, updated KV cache)
         """
-        if kv_layer_write_idx is None:
-            kv_layer_write_idx = self.layer_idx
+        # if kv_layer_write_idx is None:
+        #     kv_layer_write_idx = self.layer_idx
 
         original_dtype = Xq.dtype
         batch_size = Xq.shape[0]
@@ -255,3 +260,38 @@ class ANEMlpBlock(nn.Module):
         gate_activated = F.silu(gate)
         hidden = torch.mul(gate_activated, up).to(self.dtype)
         return self.wo(hidden)
+
+class ANEEncoderLayer(nn.Module):
+    def __init__(self, layer: EncoderLayer):
+        super().__init__()
+        self.layer = layer
+        self.pre_sa_norm = ANERMSNorm(
+            self.layer.pre_sa_norm,
+            dim=-1,
+            w_num_unsqueezes=2,
+        )
+        self.self_attention = ANEAttention(
+            self.layer.self_attention,
+        )
+        self.post_sa_norm = ANERMSNorm(
+            self.layer.post_sa_norm,
+            dim=-1,
+            w_num_unsqueezes=2,
+        )
+        self.mlp = ANEMlpBlock(
+            self.layer.mlp,
+        )
+
+    def forward(self,
+        x: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        sin_q: Optional[torch.Tensor] = None,
+        cos_q: Optional[torch.Tensor] = None,
+    ):
+        residual = x
+        x = self.pre_sa_norm(x)
+        x = self.self_attention(x, x, attn_mask=attn_mask, sin_q=sin_q, cos_q=cos_q, sin_k=sin_q, cos_k=cos_q)
+        x = residual = x + residual
+        x = self.post_sa_norm(x)
+        x = self.mlp(x)
+        return residual + x

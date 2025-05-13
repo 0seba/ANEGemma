@@ -6,6 +6,8 @@ from ane_models.dia.dia.dia.layers import (
     MlpBlock,
     RotaryEmbedding,
     Attention,
+    EncoderLayer,
+    EncoderInferenceState,
 )
 from ane_models.dia.dia.dia.config import DiaConfig, ModelConfig, EncoderConfig, DecoderConfig, DataConfig
 from ane_models.dia.dia.dia.state import KVCache, create_attn_mask
@@ -15,6 +17,8 @@ from ane_models.dia.ane_dia import (
     apply_rotary_embedding,
     ANEAttention,
     update_kv_cache,
+    ANEEncoderLayer,
+    ANERotaryEmbedding,
 )
 
 
@@ -160,7 +164,7 @@ def test_ane_self_attention():
         for layer in [attn.q_proj, attn.k_proj, attn.v_proj, attn.o_proj]:
             layer.weight.data.normal_(0, 0.1)
 
-    ane_attn = ANEAttention(attn, layer_idx=0)
+    ane_attn = ANEAttention(attn)
 
     # Create original rotary embedding and ANE version
     ane_rope = ANERotaryEmbedding(attn.rotary_emb, max_seq_len=1024)
@@ -216,6 +220,7 @@ def test_ane_self_attention():
             attn_mask=attn_mask,
             cache=(k_ane, v_ane),
             kv_write_idx=torch.tensor(offset, device=x_std.device),
+            kv_layer_write_idx=0,
         )
         y_ane = y_ane.squeeze(2).transpose(1, 2)  # Convert back to [batch, seq_len, embed_dim]
     # Verify outputs match
@@ -294,7 +299,7 @@ def test_ane_cross_attention():
         for layer in [attn.q_proj, attn.k_proj, attn.v_proj, attn.o_proj]:
             layer.weight.data.normal_(0, 0.1)
 
-    ane_attn = ANEAttention(attn, layer_idx=0)
+    ane_attn = ANEAttention(attn)
 
     # Create original rotary embedding and ANE version
     ane_rope = ANERotaryEmbedding(attn.rotary_emb, max_seq_len=1024)
@@ -360,11 +365,99 @@ def test_ane_cross_attention():
     print("ANEAttention cross-attention test passed!")
 
 
+def test_ane_encoder_layer():
+    """
+    Test that ANEEncoderLayer produces outputs close to EncoderLayer
+    using the same weights and random input, including rotary embeddings and mask.
+    """
+    # Setup test dimensions and config
+    batch_size, seq_len, embed_dim, n_hidden, n_head, head_dim = 2, 6, 8, 16, 4, 2
+    compute_dtype = torch.float32
+
+    config = DiaConfig(
+        model=ModelConfig(
+            encoder=EncoderConfig(
+                n_layer=1,
+                n_embd=embed_dim,
+                n_hidden=n_hidden,
+                n_head=n_head,
+                head_dim=head_dim,
+            ),
+            decoder=DecoderConfig(
+                n_layer=1,
+                n_embd=embed_dim,
+                n_hidden=n_hidden,
+                gqa_query_heads=n_head,
+                kv_heads=n_head,
+                gqa_head_dim=head_dim,
+                cross_query_heads=n_head,
+                cross_head_dim=head_dim,
+            ),
+            rope_min_timescale=1,
+            rope_max_timescale=10000,
+        ),
+        data=DataConfig(
+            text_length=seq_len,
+            audio_length=seq_len,
+        ),
+    )
+
+    # Create EncoderLayer and ANEEncoderLayer
+    encoder_layer = EncoderLayer(config, compute_dtype)
+    ane_encoder_layer = ANEEncoderLayer(encoder_layer)
+
+    # Create random input and dummy state
+    x = torch.randn((batch_size, seq_len, embed_dim), dtype=compute_dtype)
+    positions = torch.arange(seq_len, dtype=torch.long).unsqueeze(0).repeat(batch_size, 1)
+    attn_mask = torch.ones((batch_size, 1, seq_len, seq_len), dtype=torch.bool)
+
+    # Prepare rotary embeddings using the encoder's rotary_emb
+    rotary_emb = encoder_layer.self_attention.rotary_emb
+    ane_rope = ANERotaryEmbedding(rotary_emb, max_seq_len=seq_len+1)
+    sin_q, cos_q = ane_rope(positions, permute_for_ane=True)
+    # Add head dimension for ANEAttention (B, 1, D/2, T)
+    sin_q, cos_q = sin_q.unsqueeze(1), cos_q.unsqueeze(1)
+
+    # Prepare mask for ANE (NCHW): [B, 1, T, T]
+    mask = attn_mask
+    # mask = mask.to(x.dtype)
+    # Convert to additive mask: 0 for keep, -inf for mask out
+    mask = torch.where(mask, torch.tensor(0.0, dtype=x.dtype), torch.tensor(-float('inf'), dtype=x.dtype))
+
+    # Forward pass through original EncoderLayer
+    state = EncoderInferenceState(
+        positions=positions,
+        attn_mask=attn_mask,
+        max_seq_len=seq_len,
+        device=x.device,
+        padding_mask=attn_mask,
+    )
+    with torch.no_grad():
+        y_std = encoder_layer(x, state)
+
+    # Prepare input for ANEEncoderLayer (channels first)
+    x_ane = x.transpose(1, 2).unsqueeze(2)  # [B, D, 1, T]
+
+    # Forward pass through ANEEncoderLayer
+    with torch.no_grad():
+        y_ane = ane_encoder_layer(x_ane, attn_mask=mask, sin_q=sin_q, cos_q=cos_q)
+        y_ane = y_ane.squeeze(2).transpose(1, 2)  # [B, T, D]
+
+    # Compare outputs
+    test_case = TestCase()
+    test_case.assertTrue(
+        torch.allclose(y_std, y_ane, rtol=1e-4, atol=1e-4),
+        "ANEEncoderLayer output doesn't match EncoderLayer output"
+    )
+    print("ANEEncoderLayer test passed!")
+
+
 def test_all():
     test_ane_mlp_block()
     test_ane_rotary_embedding()
     test_ane_self_attention()
     test_ane_cross_attention()
+    test_ane_encoder_layer()
 
 
 if __name__ == "__main__":
