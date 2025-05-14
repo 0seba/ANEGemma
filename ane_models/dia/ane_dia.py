@@ -1,4 +1,4 @@
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict, Any, Callable, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,7 +10,10 @@ from ane_models.dia.dia.dia.layers import (
     RotaryEmbedding,
     Attention,
     EncoderLayer,
+    Encoder,
+    DecoderLayer,
 )
+from ane_models.dia.dia.dia.state import create_attn_mask
 from layers.ane_ops import (
     ane_linear,
     simple_attention,
@@ -40,13 +43,15 @@ class ANERotaryEmbedding(nn.Module):
         self.embedding_dims = rotary_embedding.embedding_dims
 
         # Precompute sin and cos values for all positions up to max_seq_len
-        positions = torch.arange(max_seq_len, dtype=torch.float32).unsqueeze(-1) # (max_seq_len, 1)
-        timescale = rotary_embedding.timescale # (1, 1, half_dim)
+        positions = torch.arange(max_seq_len, dtype=torch.float32).unsqueeze(
+            -1
+        )  # (max_seq_len, 1)
+        timescale = rotary_embedding.timescale  # (1, 1, half_dim)
 
         # Calculate in fp32 for accuracy but store in fp16 for ANE compatibility (the fp16 will be done internally during coremltools conversion)
-        sinusoid_inp = positions / timescale # (max_seq_len, half_dim)
-        sin_values = torch.sin(sinusoid_inp) # .to(torch.float16)
-        cos_values = torch.cos(sinusoid_inp) # .to(torch.float16)
+        sinusoid_inp = positions / timescale  # (max_seq_len, half_dim)
+        sin_values = torch.sin(sinusoid_inp)  # .to(torch.float16)
+        cos_values = torch.cos(sinusoid_inp)  # .to(torch.float16)
 
         self.register_buffer("sin_values", sin_values, persistent=True)
         self.register_buffer("cos_values", cos_values, persistent=True)
@@ -67,10 +72,12 @@ class ANERotaryEmbedding(nn.Module):
                 If permute_for_ane=True:  [batch_size, half_embedding_dim, seq_len]
         """
         if position.max() >= self.max_seq_len:
-            raise ValueError(f"Position index {position.max()} exceeds maximum precomputed length ({self.max_seq_len})")
+            raise ValueError(
+                f"Position index {position.max()} exceeds maximum precomputed length ({self.max_seq_len})"
+            )
 
         # Lookup precomputed values and reshape to expected output format
-        sin = self.sin_values[position] # (B, L, D/2)
+        sin = self.sin_values[position]  # (B, L, D/2)
         cos = self.cos_values[position]
 
         # Optionally permute for ANE format for direct use with apply_rotary_embedding
@@ -81,7 +88,9 @@ class ANERotaryEmbedding(nn.Module):
         return sin, cos
 
 
-def apply_rotary_embedding(inputs: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor) -> torch.Tensor:
+def apply_rotary_embedding(
+    inputs: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor
+) -> torch.Tensor:
     """
     Apply rotary position embeddings to input tensors using precomputed values.
 
@@ -100,6 +109,7 @@ def apply_rotary_embedding(inputs: torch.Tensor, sin: torch.Tensor, cos: torch.T
     second_part = second_half * cos + first_half * sin
 
     return torch.cat((first_part, second_part), dim=-2).to(input_dtype)
+
 
 class ANEAttention(nn.Module):
     """
@@ -136,8 +146,12 @@ class ANEAttention(nn.Module):
         Xkv: Tensor | None,  # (B, E, 1, S) NCHW format for ANE
         sin_q: Tensor,  # (B, 1, H/2, S) precomputed sin for query in ANE format
         cos_q: Tensor,  # (B, 1,  H/2, S) precomputed cos for query in ANE format
-        sin_k: Optional[Tensor] = None,  # (B, 1, H/2, T) precomputed sin for key in ANE format
-        cos_k: Optional[Tensor] = None,  # (B, 1, H/2, T) precomputed cos for key in ANE format
+        sin_k: Optional[
+            Tensor
+        ] = None,  # (B, 1, H/2, T) precomputed sin for key in ANE format
+        cos_k: Optional[
+            Tensor
+        ] = None,  # (B, 1, H/2, T) precomputed cos for key in ANE format
         attn_mask: Optional[Tensor] = None,  # (B, 1, T, S) or None
         cache: Optional[Tuple[Tensor, Tensor]] = None,  # KV Cache for ANE format
         kv_write_idx: Optional[Tensor] = None,
@@ -169,7 +183,9 @@ class ANEAttention(nn.Module):
 
         # (B, D, 1, S) -> (B, N*H, 1, S) for query
         q_proj = self.q_proj(Xq)
-        q_proj = q_proj.view(batch_size, self.num_query_heads, self.head_dim, seqlen_q) # (B, N, H, S)
+        q_proj = q_proj.view(
+            batch_size, self.num_query_heads, self.head_dim, seqlen_q
+        )  # (B, N, H, S)
         q_rotated = apply_rotary_embedding(q_proj, sin_q, cos_q)
         # q_proj = q_proj.permute(0, 2, 1, 3)
 
@@ -184,14 +200,20 @@ class ANEAttention(nn.Module):
         else:
             seqlen_k = Xkv.shape[-1]
             k_proj = self.k_proj(Xkv)  # (B, H*D, 1, S)
-            k_proj = k_proj.view(batch_size, self.num_kv_heads, self.head_dim, seqlen_k) # (B, H, D, S)
+            k_proj = k_proj.view(
+                batch_size, self.num_kv_heads, self.head_dim, seqlen_k
+            )  # (B, H, D, S)
             k_rotated = apply_rotary_embedding(k_proj, sin_k, cos_k)
-            k_rotated = k_rotated.permute(0, 1, 3, 2) # (B, H, S, D)
-            v_proj = self.v_proj(Xkv).view(batch_size, self.num_kv_heads, self.head_dim, seqlen_k) # (B, H, D, S)
+            k_rotated = k_rotated.permute(0, 1, 3, 2)  # (B, H, S, D)
+            v_proj = self.v_proj(Xkv).view(
+                batch_size, self.num_kv_heads, self.head_dim, seqlen_k
+            )  # (B, H, D, S)
             # v_proj = v_proj.permute(0, 1, 3, 2) # (B, H, S, D)
             # print("v_proj permute size:", v_proj.size())
             if cache is not None:
-                update_kv_cache(k_rotated, v_proj, cache, kv_write_idx, kv_layer_write_idx)
+                update_kv_cache(
+                    k_rotated, v_proj, cache, kv_write_idx, kv_layer_write_idx
+                )
                 k_cache, v_cache = cache
                 key = k_cache[kv_layer_write_idx : kv_layer_write_idx + batch_size]
                 value = v_cache[kv_layer_write_idx : kv_layer_write_idx + batch_size]
@@ -200,7 +222,9 @@ class ANEAttention(nn.Module):
                 value = v_proj
 
             attention_output = simple_attention(
-                q_rotated, key, value,
+                q_rotated,
+                key,
+                value,
                 attention_mask=attn_mask,
                 attn_logit_softcapping=None,
             )
@@ -231,6 +255,7 @@ class ANEMlpBlock(nn.Module):
         wo (ANEDenseGeneral): ANE-friendly wrapper for the output projection
         dtype (torch.dtype): The compute dtype from the original MlpBlock
     """
+
     def __init__(
         self,
         mlp_block: MlpBlock,
@@ -254,12 +279,13 @@ class ANEMlpBlock(nn.Module):
         # Original weight shape: [embed_dim, 2, intermediate_dim]
         wi_weight = self.mlp_block.wi_fused.weight
         gate_weight = wi_weight[:, 0, :]  # First component (dim=1, idx=0)
-        up_weight = wi_weight[:, 1, :]    # Second component (dim=1, idx=1)
+        up_weight = wi_weight[:, 1, :]  # Second component (dim=1, idx=1)
         gate = ane_linear(x, gate_weight.T, w_num_unsqueezes=2)
         up = ane_linear(x, up_weight.T, w_num_unsqueezes=2)
         gate_activated = F.silu(gate)
         hidden = torch.mul(gate_activated, up).to(self.dtype)
         return self.wo(hidden)
+
 
 class ANEEncoderLayer(nn.Module):
     def __init__(self, layer: EncoderLayer):
@@ -267,7 +293,7 @@ class ANEEncoderLayer(nn.Module):
         self.layer = layer
         self.pre_sa_norm = ANERMSNorm(
             self.layer.pre_sa_norm,
-            dim=-1,
+            dim=1,
             w_num_unsqueezes=2,
         )
         self.self_attention = ANEAttention(
@@ -275,14 +301,15 @@ class ANEEncoderLayer(nn.Module):
         )
         self.post_sa_norm = ANERMSNorm(
             self.layer.post_sa_norm,
-            dim=-1,
+            dim=1,
             w_num_unsqueezes=2,
         )
         self.mlp = ANEMlpBlock(
             self.layer.mlp,
         )
 
-    def forward(self,
+    def forward(
+        self,
         x: torch.Tensor,
         attn_mask: Optional[torch.Tensor] = None,
         sin_q: Optional[torch.Tensor] = None,
@@ -290,8 +317,180 @@ class ANEEncoderLayer(nn.Module):
     ):
         residual = x
         x = self.pre_sa_norm(x)
-        x = self.self_attention(x, x, attn_mask=attn_mask, sin_q=sin_q, cos_q=cos_q, sin_k=sin_q, cos_k=cos_q)
-        x = residual = x + residual
+        x = self.self_attention(
+            x,
+            x,
+            attn_mask=attn_mask,
+            sin_q=sin_q,
+            cos_q=cos_q,
+            sin_k=sin_q,
+            cos_k=cos_q,
+        )
+        x = x + residual
+        residual = x
         x = self.post_sa_norm(x)
         x = self.mlp(x)
         return residual + x
+
+
+class ANEEncoder(nn.Module):
+    """
+    ANE-friendly implementation of the Encoder module.
+
+    This implementation:
+    1. Uses ANE-friendly operations and layouts
+    2. Maintains NCHW format throughout
+    3. Uses precomputed rotary embeddings
+    """
+
+    def __init__(self, encoder: Encoder, max_seq_len: int = 4096):
+        super().__init__()
+        self.encoder = encoder
+        self.max_seq_len = max_seq_len
+
+        # Create ANE-compatible layers
+        self.embedding = encoder.embedding  # Keep original embedding for now
+        self.layers = nn.ModuleList(
+            [ANEEncoderLayer(layer) for layer in encoder.layers]
+        )
+        self.norm = ANERMSNorm(encoder.norm, dim=1, w_num_unsqueezes=2)
+
+        # Pre-compute rotary embeddings
+        self.rotary_emb = ANERotaryEmbedding(
+            encoder.layers[0].self_attention.rotary_emb, max_seq_len=max_seq_len
+        )
+
+    def forward(
+        self,
+        x_ids: torch.Tensor,  # [B, T]
+        positions: torch.Tensor,  # [B, T]
+        padding_mask: Optional[torch.Tensor] = None,  # [B, T]
+    ) -> torch.Tensor:
+        """
+        Args:
+            x_ids: Input token IDs [B, T]
+            padding_mask: Boolean mask where True indicates padding tokens [B, T]
+
+        Returns:
+            Tensor of shape [B, T, D] in channels-last format
+        """
+        # Get rotary embeddings [B, 1, D/2, T]
+        sin_q, cos_q = self.rotary_emb(positions, permute_for_ane=True)
+        sin_q, cos_q = sin_q.unsqueeze(1), cos_q.unsqueeze(1)
+
+        # Create attention mask [B, 1, T, T]
+        if padding_mask is None:
+            padding_mask = torch.ones_like(x_ids, dtype=torch.bool)
+
+        # Create diagonal attention mask where padding tokens only attend to themselves
+        attn_mask = create_attn_mask(
+            q_padding_mask_1d=padding_mask,
+            k_padding_mask_1d=padding_mask,
+            device=x_ids.device,
+            is_causal=False,
+        )
+        attn_mask = attn_mask.transpose(-1, -2)
+        x = self.embedding(x_ids)  # [B, T, D]
+        x = x.transpose(1, 2).unsqueeze(2)  # [B, D, 1, T]
+        attn_mask = torch.where(
+            attn_mask,
+            torch.tensor(0.0, dtype=x.dtype),
+            torch.tensor(-float("inf"), dtype=x.dtype),
+        )
+        for i, layer in enumerate(self.layers):
+            x = layer(
+                x,
+                attn_mask=attn_mask,
+                sin_q=sin_q,
+                cos_q=cos_q,
+            )
+        x = self.norm(x)
+
+        return x
+
+
+class ANEDecoderLayer(nn.Module):
+    def __init__(self, layer: "DecoderLayer"):
+        super().__init__()
+        self.layer = layer
+
+        self.pre_sa_norm = ANERMSNorm(
+            self.layer.pre_sa_norm,
+            dim=1,
+            w_num_unsqueezes=2,
+        )
+        self.pre_ca_norm = ANERMSNorm(
+            self.layer.pre_ca_norm,
+            dim=1,
+            w_num_unsqueezes=2,
+        )
+        self.pre_mlp_norm = ANERMSNorm(
+            self.layer.pre_mlp_norm,
+            dim=1,
+            w_num_unsqueezes=2,
+        )
+
+        self.self_attention = ANEAttention(self.layer.self_attention)
+        self.cross_attention = ANEAttention(self.layer.cross_attention)
+        self.mlp = ANEMlpBlock(self.layer.mlp)
+        self.compute_dtype = self.layer.compute_dtype
+
+    def forward(
+        self,
+        x: torch.Tensor,  # [B, D, 1, T] in NCHW format
+        sin_q: torch.Tensor,  # [B, 1, D/2, T]
+        cos_q: torch.Tensor,  # [B, 1, D/2, T]
+        kv_write_index: torch.Tensor,
+        kv_layer_write_idx: int,
+        sin_k: Optional[torch.Tensor] = None,  # [B, 1, D/2, T]
+        cos_k: Optional[torch.Tensor] = None,  # [B, 1, D/2, T]
+        self_attn_mask: Optional[torch.Tensor] = None,  # [B, 1, T, S] or None
+        cross_attn_mask: Optional[torch.Tensor] = None,  # [B, 1, T, S] or None
+        enc_out: Optional[torch.Tensor] = None,  # [B, D, 1, S] in NCHW format
+        self_attn_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        cross_attn_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        residual = x
+        x_norm = self.pre_sa_norm(x)
+        if sin_k is None or cos_k is None:
+            sin_k = sin_q
+            cos_k = cos_q
+        # Self-attention with KV cache
+        sa_out = self.self_attention(
+            Xq=x_norm,
+            Xkv=x_norm,
+            sin_q=sin_q,
+            cos_q=cos_q,
+            sin_k=sin_q,
+            cos_k=cos_q,
+            attn_mask=self_attn_mask,
+            cache=self_attn_cache,
+            kv_write_idx=kv_write_index,
+            kv_layer_write_idx=kv_layer_write_idx,
+        )
+
+        x = residual + sa_out
+
+        residual = x
+        x_norm = self.pre_ca_norm(x)
+
+        ca_out = self.cross_attention(
+            Xq=x_norm,
+            Xkv=enc_out,
+            sin_q=sin_q,
+            cos_q=cos_q,
+            sin_k=sin_k,
+            cos_k=cos_k,
+            attn_mask=cross_attn_mask,
+            cache=cross_attn_cache,
+            kv_write_idx=0,
+            kv_layer_write_idx=kv_layer_write_idx,
+        )
+
+        x = residual + ca_out
+        residual = x
+        x_norm = self.pre_mlp_norm(x)
+        mlp_out = self.mlp(x_norm)
+        x = residual + mlp_out
+
+        return x

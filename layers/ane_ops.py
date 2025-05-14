@@ -42,12 +42,12 @@ class ANERMSNorm(nn.Module):
 
     def forward(self, x):
         return ane_rms_norm(
-            x,
+            x.float(),
             dim=self.dim,
             w=self.layer.weight,
             w_num_unsqueezes=self.w_num_unsqueezes,
             eps=self.layer.eps,
-        )
+        ).to(x.dtype)
 
 def ane_linear(x: Tensor, w: Tensor, bias: Optional[Tensor] = None, w_num_unsqueezes: int = 2):
     # Assume x has shape (B, C, 1, L)
