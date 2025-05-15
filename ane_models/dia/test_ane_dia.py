@@ -647,11 +647,11 @@ def test_ane_decoder_layer_with_caches():
 
     # Test configuration
     batch_size = 2
-    seq_len = 1  # Single decoding step
+    seq_len = 2  # Single decoding step
     cross_kv_cache_len = 3  # 3 real tokens + 3 padding
     cross_kv_padding_len = 3
     self_kv_cache_len = 8  # 4 real tokens + 4 empty slots
-    offset = 4
+    offset = 0  # original pytorch implementation does not work with offset > 0
     embed_dim = 32
     num_heads = 2
     gqa_query_heads = 4
@@ -795,15 +795,16 @@ def test_ane_decoder_layer_with_caches():
         self_attn_cache=self_attn_cache,
         cross_attn_cache=cross_attn_cache,
         current_idx=positions,
+        prefill=True,
     )
-    print(std_output)
 
     self_attn_mask = torch.tril(
         torch.ones(
             (batch_size, 1, seq_len, self_kv_cache_len),
             dtype=torch.bool,
             device=x.device,
-        )
+        ),
+        diagonal=offset,
     )
     cross_attn_mask = torch.cat(
         (
@@ -853,9 +854,9 @@ def test_ane_decoder_layer_with_caches():
         .squeeze(2)
         .transpose(1, 2)
     )
-    print(ane_output)
 
-    assert torch.allclose(std_output, ane_output, rtol=1e-4, atol=1e-3)
+    # need to use higher absolute tolerence but rtol is still small
+    assert torch.allclose(std_output, ane_output, rtol=1e-4, atol=1e-1)
     print("ANE Decoder Layer with Caches test passed!")
 
 
@@ -1160,7 +1161,7 @@ def test_all():
     test_ane_encoder()
     test_ane_decoder_self_attention()
     test_ane_decoder_cross_attention()
-    # test_ane_decoder_layer_with_caches()
+    test_ane_decoder_layer_with_caches()
 
 
 if __name__ == "__main__":

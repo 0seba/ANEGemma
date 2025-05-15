@@ -461,8 +461,8 @@ class ANEDecoderLayer(nn.Module):
             Xkv=x_norm,
             sin_q=sin_q,
             cos_q=cos_q,
-            sin_k=sin_q,
-            cos_k=cos_q,
+            sin_k=sin_k,
+            cos_k=cos_k,
             attn_mask=self_attn_mask,
             cache=self_attn_cache,
             kv_write_idx=kv_write_index,
@@ -473,7 +473,6 @@ class ANEDecoderLayer(nn.Module):
 
         residual = x
         x_norm = self.pre_ca_norm(x)
-
         ca_out = self.cross_attention(
             Xq=x_norm,
             Xkv=enc_out,
@@ -486,8 +485,8 @@ class ANEDecoderLayer(nn.Module):
             kv_write_idx=0,
             kv_layer_write_idx=kv_layer_write_idx,
         )
-
         x = residual + ca_out
+
         residual = x
         x_norm = self.pre_mlp_norm(x)
         mlp_out = self.mlp(x_norm)
